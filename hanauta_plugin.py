@@ -115,6 +115,154 @@ def build_ani_cli_service_section(window, api: dict[str, object]) -> QWidget:
         )
     )
 
+    quality_input = QLineEdit(str(plugin_state.get("quality", "best")).strip() or "best")
+    quality_input.setPlaceholderText("best, worst, 1080p, 720p...")
+    layout.addWidget(
+        SettingsRow(
+            material_icon("high_quality"),
+            "Playback quality",
+            "Maps to ani-cli `-q/--quality`.",
+            window.icon_font,
+            window.ui_font,
+            quality_input,
+        )
+    )
+
+    select_nth_input = QLineEdit(str(plugin_state.get("select_nth", "1")).strip() or "1")
+    select_nth_input.setPlaceholderText("1")
+    layout.addWidget(
+        SettingsRow(
+            material_icon("looks_one"),
+            "Select nth source",
+            "Maps to ani-cli `-S/--select-nth` (which stream source entry to auto-pick).",
+            window.icon_font,
+            window.ui_font,
+            select_nth_input,
+        )
+    )
+
+    skip_title_input = QLineEdit(str(plugin_state.get("skip_title", "")).strip())
+    skip_title_input.setPlaceholderText("Optional title for --skip-title")
+    layout.addWidget(
+        SettingsRow(
+            material_icon("title"),
+            "Skip title override",
+            "Optional ani-skip query title (`--skip-title`) when intro skip is enabled.",
+            window.icon_font,
+            window.ui_font,
+            skip_title_input,
+        )
+    )
+
+    use_vlc_switch = SwitchButton(bool(plugin_state.get("use_vlc", False)))
+    layout.addWidget(
+        SettingsRow(
+            material_icon("smart_display"),
+            "Use VLC player",
+            "Uses `--vlc` instead of mpv.",
+            window.icon_font,
+            window.ui_font,
+            use_vlc_switch,
+        )
+    )
+
+    dub_switch = SwitchButton(bool(plugin_state.get("dub", False)))
+    layout.addWidget(
+        SettingsRow(
+            material_icon("record_voice_over"),
+            "Prefer dubbed",
+            "Uses `--dub` when available.",
+            window.icon_font,
+            window.ui_font,
+            dub_switch,
+        )
+    )
+
+    skip_intro_switch = SwitchButton(bool(plugin_state.get("skip_intro", True)))
+    layout.addWidget(
+        SettingsRow(
+            material_icon("fast_forward"),
+            "Skip intros",
+            "Uses `--skip` (mpv only).",
+            window.icon_font,
+            window.ui_font,
+            skip_intro_switch,
+        )
+    )
+
+    syncplay_switch = SwitchButton(bool(plugin_state.get("syncplay", False)))
+    layout.addWidget(
+        SettingsRow(
+            material_icon("groups"),
+            "Syncplay mode",
+            "Uses `--syncplay` for watch parties (requires syncplay setup).",
+            window.icon_font,
+            window.ui_font,
+            syncplay_switch,
+        )
+    )
+
+    nextep_switch = SwitchButton(bool(plugin_state.get("nextep_countdown", False)))
+    layout.addWidget(
+        SettingsRow(
+            material_icon("hourglass_bottom"),
+            "Next episode countdown",
+            "Uses `--nextep-countdown` after playback.",
+            window.icon_font,
+            window.ui_font,
+            nextep_switch,
+        )
+    )
+
+    download_switch = SwitchButton(bool(plugin_state.get("download_mode", False)))
+    layout.addWidget(
+        SettingsRow(
+            material_icon("download"),
+            "Download mode",
+            "Uses `--download` instead of launching the player immediately.",
+            window.icon_font,
+            window.ui_font,
+            download_switch,
+        )
+    )
+
+    no_detach_switch = SwitchButton(bool(plugin_state.get("no_detach", True)))
+    layout.addWidget(
+        SettingsRow(
+            material_icon("link"),
+            "Keep player attached",
+            "Uses `--no-detach` (recommended for fullscreen handoff).",
+            window.icon_font,
+            window.ui_font,
+            no_detach_switch,
+        )
+    )
+
+    exit_after_play_switch = SwitchButton(bool(plugin_state.get("exit_after_play", True)))
+    layout.addWidget(
+        SettingsRow(
+            material_icon("logout"),
+            "Exit after play",
+            "Uses `--exit-after-play` (recommended for returning to Hanauta).",
+            window.icon_font,
+            window.ui_font,
+            exit_after_play_switch,
+        )
+    )
+
+    extra_args_input = QLineEdit(str(plugin_state.get("extra_args", "")).strip())
+    extra_args_input.setPlaceholderText("--continue  (advanced)")
+    layout.addWidget(
+        SettingsRow(
+            material_icon("terminal"),
+            "Extra ani-cli args",
+            "Advanced: appended as raw flags (for options like --continue, --rofi, --logview).",
+            window.icon_font,
+            window.ui_font,
+            extra_args_input,
+        )
+    )
+
     save_tmdb_button = QPushButton("Save Ani CLI Settings")
     save_tmdb_button.setObjectName("secondaryButton")
     save_tmdb_button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -122,8 +270,21 @@ def build_ani_cli_service_section(window, api: dict[str, object]) -> QWidget:
     def _save_tmdb_settings() -> None:
         state = load_plugin_state()
         state["tmdb_api_key"] = tmdb_key_input.text().strip()
+        state["quality"] = quality_input.text().strip() or "best"
+        select_nth_raw = select_nth_input.text().strip()
+        state["select_nth"] = select_nth_raw if select_nth_raw.isdigit() else "1"
+        state["skip_title"] = skip_title_input.text().strip()
+        state["use_vlc"] = bool(use_vlc_switch.isChecked())
+        state["dub"] = bool(dub_switch.isChecked())
+        state["skip_intro"] = bool(skip_intro_switch.isChecked())
+        state["syncplay"] = bool(syncplay_switch.isChecked())
+        state["nextep_countdown"] = bool(nextep_switch.isChecked())
+        state["download_mode"] = bool(download_switch.isChecked())
+        state["no_detach"] = bool(no_detach_switch.isChecked())
+        state["exit_after_play"] = bool(exit_after_play_switch.isChecked())
+        state["extra_args"] = extra_args_input.text().strip()
         save_plugin_state(state)
-        window.ani_cli_status.setText("Ani CLI settings saved. Relaunch fullscreen app to apply updated TMDB key.")
+        window.ani_cli_status.setText("Ani CLI settings saved. Relaunch fullscreen app to apply changes.")
 
     save_tmdb_button.clicked.connect(_save_tmdb_settings)
     layout.addWidget(

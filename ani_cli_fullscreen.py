@@ -5,13 +5,15 @@ import html
 import json
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib import parse, request
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QCursor, QFont, QFontDatabase, QIcon, QPainter, QPainterPath, QPen, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -33,25 +35,26 @@ from PyQt6.QtWidgets import (
 
 FONTS_DIR = Path.home() / ".config" / "i3" / "assets" / "fonts"
 PLUGIN_STATE_FILE = Path.home() / ".local" / "state" / "hanauta" / "plugins" / "ani-cli.json"
+SERVICE_PLUGIN_STATE_DIR = Path.home() / ".local" / "state" / "hanauta" / "service" / "plugins"
+SERVICE_PRELOAD_JSON = SERVICE_PLUGIN_STATE_DIR / "ani_cli_catalog.json"
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p/w342"
+HANAUTA_SRC = Path.home() / ".config" / "i3" / "hanauta" / "src"
+THEME_PALETTE_FILE = Path.home() / ".local" / "state" / "hanauta" / "theme" / "pyqt_palette.json"
+
+if str(HANAUTA_SRC) not in sys.path and HANAUTA_SRC.exists():
+    sys.path.insert(0, str(HANAUTA_SRC))
+
+try:
+    from pyqt.shared.theme import load_theme_palette as _load_shared_theme_palette
+    from pyqt.shared.theme import palette_mtime as _shared_palette_mtime
+except Exception:
+    _load_shared_theme_palette = None
+    _shared_palette_mtime = None
 
 IGNORE_TITLES = {
-    "The Movie Database (TMDB)",
-    "TV Shows",
-    "Movies",
-    "People",
-    "Collections",
-    "Keywords",
-    "Companies",
-    "Networks",
-    "Awards",
-    "\u00c9missions t\u00e9l\u00e9vis\u00e9es",
-    "Films",
-    "Artistes",
-    "Mots-cl\u00e9s",
-    "Soci\u00e9t\u00e9s",
-    "Diffuseurs",
-    "Prix",
+    "The Movie Database (TMDB)", "TV Shows", "Movies", "People", "Collections", 
+    "Keywords", "Companies", "Networks", "Awards", "\u00c9missions t\u00e9l\u00e9vis\u00e9es",
+    "Films", "Artistes", "Mots-cl\u00e9s", "Soci\u00e9t\u00e9s", "Diffuseurs", "Prix",
 }
 
 
@@ -76,7 +79,19 @@ def load_font_family() -> str:
             families = QFontDatabase.applicationFontFamilies(font_id)
             if families:
                 return families[0]
+    if QFont("Rubik").exactMatch():
+        return "Rubik"
     return "Sans Serif"
+
+
+def apply_antialias_font(widget: QWidget) -> None:
+    base_font = widget.font()
+    base_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    widget.setFont(base_font)
+    for child in widget.findChildren(QWidget):
+        font = child.font()
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        child.setFont(font)
 
 
 def _normalize_poster_url(raw: str) -> str:
@@ -108,8 +123,154 @@ def _pick_title(row: dict[str, object]) -> str:
     return ""
 
 
+def _safe_hex(value: object, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text.startswith("#"):
+        text = f"#{text}"
+    if len(text) != 7:
+        return fallback
+    try:
+        int(text[1:], 16)
+    except ValueError:
+        return fallback
+    return text.upper()
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    normalized = _safe_hex(color, "#000000")
+    return (
+        int(normalized[1:3], 16),
+        int(normalized[3:5], 16),
+        int(normalized[5:7], 16),
+    )
+
+
+def rgba(color: str, alpha: float) -> str:
+    red, green, blue = _hex_to_rgb(color)
+    clamped = max(0.0, min(1.0, alpha))
+    return f"rgba({red}, {green}, {blue}, {clamped:.2f})"
+
+
+def blend(color_a: str, color_b: str, ratio: float) -> str:
+    ra, ga, ba = _hex_to_rgb(color_a)
+    rb, gb, bb = _hex_to_rgb(color_b)
+    t = max(0.0, min(1.0, ratio))
+    red = int(ra + (rb - ra) * t)
+    green = int(ga + (gb - ga) * t)
+    blue = int(ba + (bb - ba) * t)
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
+def theme_palette_mtime() -> float:
+    if _shared_palette_mtime is not None:
+        try:
+            return float(_shared_palette_mtime())
+        except Exception:
+            pass
+    try:
+        return THEME_PALETTE_FILE.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def load_runtime_theme() -> dict[str, object]:
+    if _load_shared_theme_palette is not None:
+        try:
+            theme = _load_shared_theme_palette()
+            return {
+                "primary": str(theme.primary),
+                "on_primary": str(theme.on_primary),
+                "secondary": str(theme.secondary),
+                "background": str(theme.background),
+                "surface": str(theme.surface),
+                "surface_container": str(theme.surface_container),
+                "surface_container_high": str(theme.surface_container_high),
+                "on_surface": str(theme.on_surface),
+                "on_surface_variant": str(theme.on_surface_variant),
+                "outline": str(theme.outline),
+                "text": str(theme.text),
+                "text_muted": str(theme.text_muted),
+                "active_text": str(theme.active_text),
+                "use_matugen": bool(theme.use_matugen),
+            }
+        except Exception:
+            pass
+    fallback = {
+        "primary": "#CBA6F7",
+        "on_primary": "#11111B",
+        "secondary": "#89B4FA",
+        "background": "#11111B",
+        "surface": "#181825",
+        "surface_container": "#1E1E2E",
+        "surface_container_high": "#313244",
+        "on_surface": "#CDD6F4",
+        "on_surface_variant": "#A6ADC8",
+        "outline": "#6C7086",
+        "text": "#CDD6F4",
+        "text_muted": "rgba(205,214,244,0.78)",
+        "active_text": "#11111B",
+        "use_matugen": False,
+    }
+    try:
+        payload = json.loads(THEME_PALETTE_FILE.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            fallback["primary"] = _safe_hex(payload.get("primary"), fallback["primary"])
+            fallback["on_primary"] = _safe_hex(payload.get("on_primary"), fallback["on_primary"])
+            fallback["secondary"] = _safe_hex(payload.get("secondary"), fallback["secondary"])
+            fallback["background"] = _safe_hex(payload.get("background"), fallback["background"])
+            fallback["surface"] = _safe_hex(payload.get("surface"), fallback["surface"])
+            fallback["surface_container"] = _safe_hex(payload.get("surface_container"), fallback["surface_container"])
+            fallback["surface_container_high"] = _safe_hex(payload.get("surface_container_high"), fallback["surface_container_high"])
+            fallback["on_surface"] = _safe_hex(payload.get("on_surface"), fallback["on_surface"])
+            fallback["on_surface_variant"] = _safe_hex(payload.get("on_surface_variant"), fallback["on_surface_variant"])
+            fallback["outline"] = _safe_hex(payload.get("outline"), fallback["outline"])
+            fallback["text"] = _safe_hex(payload.get("on_surface"), fallback["text"])
+            fallback["text_muted"] = rgba(fallback["on_surface_variant"], 0.78)
+            fallback["active_text"] = _safe_hex(payload.get("on_primary"), fallback["active_text"])
+            fallback["use_matugen"] = bool(payload.get("use_matugen", False))
+    except Exception:
+        pass
+    return fallback
+
+
+def load_service_preloaded_rows() -> list[dict[str, object]]:
+    try:
+        payload = json.loads(SERVICE_PRELOAD_JSON.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    rows = payload.get("items", [])
+    if not isinstance(rows, list):
+        return []
+    output: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title", "")).strip()
+        detail_url = str(row.get("detail_url", "")).strip()
+        tmdb_id = str(row.get("tmdb_id", "")).strip()
+        poster_path = Path(str(row.get("poster_path", "")).strip()).expanduser()
+        if not title or not poster_path.exists():
+            continue
+        try:
+            image_bytes = poster_path.read_bytes()
+        except Exception:
+            continue
+        if not image_bytes:
+            continue
+        output.append(
+            {
+                "title": title,
+                "image": image_bytes,
+                "detail_url": detail_url,
+                "tmdb_id": tmdb_id,
+            }
+        )
+    return output
+
+
 class CatalogWorker(QThread):
     loaded = pyqtSignal(list)
+    _last_live_query_at = 0.0
 
     def __init__(self, query: str, refresh_seed: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -120,6 +281,17 @@ class CatalogWorker(QThread):
         self.loaded.emit(self._fetch_items())
 
     def _fetch_items(self) -> list[dict[str, object]]:
+        if not self.query:
+            preloaded = load_service_preloaded_rows()
+            if preloaded:
+                return preloaded
+        if self.query and len(self.query) < 2:
+            return load_service_preloaded_rows()
+        if self.query:
+            now = time.monotonic()
+            if now - CatalogWorker._last_live_query_at < 1.0:
+                return load_service_preloaded_rows()
+            CatalogWorker._last_live_query_at = now
         key = tmdb_api_key()
         if key:
             rows = self._fetch_via_tmdb_api(key)
@@ -183,7 +355,7 @@ class CatalogWorker(QThread):
                         "tmdb_id": tmdb_id,
                     }
                 )
-                if len(output) >= 24:
+                if len(output) >= 16:
                     break
             return output
         except Exception:
@@ -239,7 +411,7 @@ class CatalogWorker(QThread):
                     "tmdb_id": self._extract_tmdb_id(detail_url),
                 }
             )
-            if len(output) >= 24:
+            if len(output) >= 16:
                 break
 
         if self.query:
@@ -309,11 +481,21 @@ class EpisodeWorker(QThread):
 class PosterCard(QFrame):
     clicked = pyqtSignal(int)
 
-    def __init__(self, index: int, title: str, image_bytes: bytes, font_family: str, width: int, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        index: int,
+        title: str,
+        image_bytes: bytes,
+        font_family: str,
+        width: int,
+        theme: dict[str, object],
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.index = index
         self.title = title
         self.font_family = font_family
+        self.theme = dict(theme)
         self._selected = False
         self._hovered = False
         self.setObjectName("posterCard")
@@ -329,11 +511,11 @@ class PosterCard(QFrame):
         self.setFixedWidth(card_width)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 12)
+        layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
         self.cover = QLabel()
-        self.cover.setFixedSize(card_width - 20, cover_height)
+        self.cover.setFixedSize(card_width - 24, cover_height)
         self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         pixmap = QPixmap()
@@ -346,14 +528,16 @@ class PosterCard(QFrame):
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            self.cover.setPixmap(self._rounded_pixmap(scaled, 16))
+            # Modern heavy border-radius for images
+            self.cover.setPixmap(self._rounded_pixmap(scaled, 14))
 
         self.title_label = QLabel(self.title)
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self.title_label.setWordWrap(True)
         title_font = QFont(self.font_family, 10)
-        title_font.setWeight(QFont.Weight.Medium)
+        title_font.setWeight(QFont.Weight.DemiBold)
         self.title_label.setFont(title_font)
+        self.title_label.setStyleSheet("background: transparent; border: none;")
 
         layout.addWidget(self.cover, 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(self.title_label)
@@ -363,6 +547,8 @@ class PosterCard(QFrame):
         output.fill(Qt.GlobalColor.transparent)
         painter = QPainter(output)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         path = QPainterPath()
         path.addRoundedRect(0, 0, float(pixmap.width()), float(pixmap.height()), float(radius), float(radius))
         painter.setClipPath(path)
@@ -390,22 +576,37 @@ class PosterCard(QFrame):
         super().mousePressEvent(event)
 
     def _apply_state(self) -> None:
+        primary = str(self.theme.get("primary", "#CBA6F7"))
+        secondary = str(self.theme.get("secondary", "#89B4FA"))
+        text = str(self.theme.get("text", "#CDD6F4"))
         if self._selected:
-            border = "2px solid rgba(180, 201, 255, 0.98)"
-            bg = "rgba(255,255,255,0.10)"
+            border = f"2px solid {primary}"
+            bg = rgba(primary, 0.18)
+            # Keep selected card labels readable on all Matugen palettes.
+            label_color = text
         elif self._hovered:
-            border = "1px solid rgba(255,255,255,0.26)"
-            bg = "rgba(255,255,255,0.08)"
+            border = f"2px solid {secondary}"
+            bg = rgba(secondary, 0.10)
+            label_color = text
         else:
-            border = "1px solid rgba(255,255,255,0.12)"
-            bg = "rgba(255,255,255,0.05)"
-        self.setStyleSheet(f"background: {bg}; border: {border}; border-radius: 18px;")
+            border = "2px solid transparent"
+            bg = "transparent"
+            label_color = rgba(text, 0.92)
+        self.title_label.setStyleSheet(f"background: transparent; border: none; color: {label_color};")
+        self.setStyleSheet(f"QFrame#posterCard {{ background: {bg}; border: {border}; border-radius: 20px; }}")
+
+    def update_theme(self, theme: dict[str, object]) -> None:
+        self.theme = dict(theme)
+        self._apply_state()
 
 
 class AniCliFullscreen(QWidget):
     def __init__(self) -> None:
         super().__init__()
+        self.setObjectName("rootWindow")
         self.font_family = load_font_family()
+        self.theme = load_runtime_theme()
+        self._theme_mtime = theme_palette_mtime()
         self._refresh_seed = random.randint(1, 1000)
         self._catalog_worker: CatalogWorker | None = None
         self._episode_worker: EpisodeWorker | None = None
@@ -424,9 +625,17 @@ class AniCliFullscreen(QWidget):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(220)
         self._debounce.timeout.connect(self._run_search)
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setInterval(3000)
+        self._theme_timer.timeout.connect(self._reload_theme_if_needed)
+        self._theme_timer.start()
         self._install_keyboard_shortcuts()
 
         self._build_ui()
+        ui_font = QFont(self.font_family, 11)
+        ui_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        self.setFont(ui_font)
+        apply_antialias_font(self)
         self._go_fullscreen()
         self._refresh_catalog()
 
@@ -443,95 +652,25 @@ class AniCliFullscreen(QWidget):
         QCursor.setPos(self.search_input.mapToGlobal(center))
 
     def _build_ui(self) -> None:
-        self.setStyleSheet(
-            """
-            QWidget {
-                font-family: '%s';
-                color: #F5F4FF;
-                background: #0B1020;
-            }
-            QFrame#topBar {
-                background: rgba(16, 22, 42, 0.96);
-                border-bottom: 1px solid rgba(255, 255, 255, 0.10);
-            }
-            QLineEdit#searchInput {
-                background: rgba(255, 255, 255, 0.10);
-                border: 1px solid rgba(255, 255, 255, 0.22);
-                border-radius: 16px;
-                padding: 11px 14px 11px 34px;
-                font-size: 14px;
-                color: #F6F2FF;
-            }
-            QLineEdit#searchInput:focus {
-                border: 1px solid rgba(145, 178, 255, 0.92);
-                background: rgba(255, 255, 255, 0.12);
-            }
-            QPushButton#refreshButton {
-                background: rgba(111, 149, 255, 0.95);
-                border: 0;
-                border-radius: 14px;
-                color: #F9F7FF;
-                padding: 10px 14px;
-                font-weight: 500;
-            }
-            QPushButton#refreshButton:hover { background: rgba(132, 166, 255, 0.98); }
-            QPushButton#closeRound {
-                background: rgba(255,255,255,0.12);
-                border: 1px solid rgba(255,255,255,0.26);
-                border-radius: 18px;
-                color: #FFFFFF;
-                font-size: 16px;
-                font-weight: 500;
-            }
-            QPushButton#closeRound:hover { background: rgba(255,110,130,0.86); }
-            QScrollArea#posterScroll {
-                border: none;
-                background: #0B1020;
-            }
-            QListWidget#episodesList {
-                background: rgba(255,255,255,0.06);
-                border: 1px solid rgba(255,255,255,0.14);
-                border-radius: 14px;
-                padding: 6px;
-                outline: none;
-            }
-            QListWidget#episodesList::item {
-                padding: 10px 12px;
-                border-radius: 10px;
-                margin: 2px;
-                color: rgba(247,244,255,0.94);
-            }
-            QListWidget#episodesList::item:selected {
-                background: rgba(119,159,255,0.38);
-                border: 1px solid rgba(173,197,255,0.86);
-            }
-            QPushButton#ghostButton {
-                background: rgba(255,255,255,0.08);
-                border: 1px solid rgba(255,255,255,0.18);
-                color: #F5EEFF;
-                border-radius: 12px;
-                padding: 9px 12px;
-                font-weight: 500;
-            }
-            QPushButton#ghostButton:hover { background: rgba(255,255,255,0.14); }
-            """ % self.font_family
-        )
+        self._apply_theme()
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        # Added margins around the entire app to give it that "floating island" look 
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(20)
 
         top_bar = QFrame()
         top_bar.setObjectName("topBar")
         top_layout = QHBoxLayout(top_bar)
-        top_layout.setContentsMargins(16, 12, 16, 12)
-        top_layout.setSpacing(10)
+        top_layout.setContentsMargins(20, 14, 20, 14)
+        top_layout.setSpacing(14)
 
         self.search_input = QLineEdit()
         self.search_input.setObjectName("searchInput")
         self.search_input.setPlaceholderText("Search anime on TMDB...")
         self.search_input.textChanged.connect(self._on_search_changed)
         self.search_input.returnPressed.connect(self._run_search)
+        self.search_input.installEventFilter(self)
 
         search_action = QAction(self)
         search_action.setIcon(self._search_icon())
@@ -563,11 +702,16 @@ class AniCliFullscreen(QWidget):
     def _build_catalog_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(16, 12, 16, 16)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        panel = QFrame()
+        panel.setObjectName("glassPanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(24, 24, 24, 24)
+        panel_layout.setSpacing(16)
 
         self.status_label = QLabel("Loading catalog...")
-        self.status_label.setStyleSheet("color: rgba(238,236,255,0.78);")
+        self.status_label.setObjectName("statusLabel")
 
         self.scroll = QScrollArea()
         self.scroll.setObjectName("posterScroll")
@@ -576,21 +720,27 @@ class AniCliFullscreen(QWidget):
         self.grid_host = QWidget()
         self.grid = QGridLayout(self.grid_host)
         self.grid.setContentsMargins(4, 4, 4, 8)
-        self.grid.setSpacing(14)
+        self.grid.setSpacing(16)
         self.scroll.setWidget(self.grid_host)
 
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.scroll, 1)
+        panel_layout.addWidget(self.status_label)
+        panel_layout.addWidget(self.scroll, 1)
+        layout.addWidget(panel, 1)
         return page
 
     def _build_episodes_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(24, 18, 24, 22)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        panel = QFrame()
+        panel.setObjectName("glassPanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(32, 32, 32, 32)
+        panel_layout.setSpacing(20)
 
         header_row = QHBoxLayout()
-        header_row.setSpacing(8)
+        header_row.setSpacing(12)
         self.back_button = QPushButton("Back to Catalog")
         self.back_button.setObjectName("ghostButton")
         self.back_button.clicked.connect(self._back_to_catalog)
@@ -598,22 +748,26 @@ class AniCliFullscreen(QWidget):
         header_row.addStretch(1)
 
         self.episode_title_label = QLabel("Select an Episode")
+        self.episode_title_label.setObjectName("episodeTitle")
         self.episode_title_label.setWordWrap(True)
-        title_font = QFont(self.font_family, 22)
-        title_font.setWeight(QFont.Weight.DemiBold)
+        title_font = QFont(self.font_family, 24)
+        title_font.setWeight(QFont.Weight.Bold)
         self.episode_title_label.setFont(title_font)
+        self.episode_title_label.setStyleSheet("color: #cba6f7;")
 
         self.episode_hint = QLabel("Arrow keys to navigate, Enter to play selected episode.")
-        self.episode_hint.setStyleSheet("color: rgba(241,236,255,0.72);")
+        self.episode_hint.setObjectName("episodeHint")
 
         self.episodes_list = QListWidget()
         self.episodes_list.setObjectName("episodesList")
         self.episodes_list.itemActivated.connect(self._launch_selected_episode)
+        self.episodes_list.installEventFilter(self)
 
-        layout.addLayout(header_row)
-        layout.addWidget(self.episode_title_label)
-        layout.addWidget(self.episode_hint)
-        layout.addWidget(self.episodes_list, 1)
+        panel_layout.addLayout(header_row)
+        panel_layout.addWidget(self.episode_title_label)
+        panel_layout.addWidget(self.episode_hint)
+        panel_layout.addWidget(self.episodes_list, 1)
+        layout.addWidget(panel, 1)
         return page
 
     def _search_icon(self) -> QIcon:
@@ -621,7 +775,7 @@ class AniCliFullscreen(QWidget):
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        pen = QPen(QColor("#D8D1EC"))
+        pen = QPen(QColor(str(self.theme.get("on_surface_variant", "#A6ADC8"))))
         pen.setWidth(2)
         painter.setPen(pen)
         painter.drawEllipse(2, 2, 8, 8)
@@ -729,10 +883,39 @@ class AniCliFullscreen(QWidget):
         if self.stack.currentIndex() == 0:
             self._navigate_catalog(key)
             return
-        if key == Qt.Key.Key_Up:
+        if key in (Qt.Key.Key_Up, Qt.Key.Key_Left):
             self.episodes_list.setCurrentRow(max(0, self.episodes_list.currentRow() - 1))
-        elif key == Qt.Key.Key_Down:
+        elif key in (Qt.Key.Key_Down, Qt.Key.Key_Right):
             self.episodes_list.setCurrentRow(min(self.episodes_list.count() - 1, self.episodes_list.currentRow() + 1))
+
+    def eventFilter(self, watched: object, event: object) -> bool:
+        if not isinstance(event, QEvent):
+            return super().eventFilter(watched, event)  # type: ignore[arg-type]
+        if event.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(watched, event)  # type: ignore[arg-type]
+        key_event = event  # QKeyEvent
+        key = key_event.key()  # type: ignore[attr-defined]
+
+        if watched is self.search_input and self.stack.currentIndex() == 0:
+            if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+                self._navigate_catalog(key)
+                return True
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._open_selected_card()
+                return True
+
+        if watched is self.episodes_list and self.stack.currentIndex() == 1:
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_Left):
+                self.episodes_list.setCurrentRow(max(0, self.episodes_list.currentRow() - 1))
+                return True
+            if key in (Qt.Key.Key_Down, Qt.Key.Key_Right):
+                self.episodes_list.setCurrentRow(min(self.episodes_list.count() - 1, self.episodes_list.currentRow() + 1))
+                return True
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._launch_selected_episode()
+                return True
+
+        return super().eventFilter(watched, event)  # type: ignore[arg-type]
 
     def _shortcut_activate(self) -> None:
         if self.stack.currentIndex() == 0:
@@ -761,7 +944,7 @@ class AniCliFullscreen(QWidget):
             image_bytes = row.get("image", b"")
             if not title or not isinstance(image_bytes, (bytes, bytearray)):
                 continue
-            card = PosterCard(index, title, bytes(image_bytes), self.font_family, card_width, self.grid_host)
+            card = PosterCard(index, title, bytes(image_bytes), self.font_family, card_width, self.theme, self.grid_host)
             card.clicked.connect(self._open_card_index)
             self._poster_cards.append(card)
             self.grid.addWidget(card, index // self._grid_columns, index % self._grid_columns)
@@ -771,7 +954,51 @@ class AniCliFullscreen(QWidget):
             self._select_card(0)
         self._animate_fade_in(self.catalog_page, delay_ms=0)
 
+    def _ani_cli_flags_from_settings(self) -> tuple[list[str], bool]:
+        state = load_plugin_state()
+        flags: list[str] = []
+        select_nth = str(state.get("select_nth", "1")).strip()
+        if not select_nth.isdigit():
+            select_nth = "1"
+        flags.extend(["-S", select_nth])
+        quality = str(state.get("quality", "")).strip()
+        if quality:
+            flags.extend(["-q", quality])
+        if bool(state.get("use_vlc", False)):
+            flags.append("--vlc")
+        if bool(state.get("dub", False)):
+            flags.append("--dub")
+        if bool(state.get("skip_intro", False)):
+            flags.append("--skip")
+        skip_title = str(state.get("skip_title", "")).strip()
+        if skip_title:
+            flags.extend(["--skip-title", skip_title])
+        if bool(state.get("syncplay", False)):
+            flags.append("--syncplay")
+        if bool(state.get("nextep_countdown", False)):
+            flags.append("--nextep-countdown")
+        download_mode = bool(state.get("download_mode", False))
+        if download_mode:
+            flags.append("--download")
+
+        # Keep current fullscreen flow stable by default.
+        no_detach = bool(state.get("no_detach", True))
+        exit_after_play = bool(state.get("exit_after_play", True))
+        if no_detach:
+            flags.append("--no-detach")
+        if exit_after_play:
+            flags.append("--exit-after-play")
+        extra_args = str(state.get("extra_args", "")).strip()
+        if extra_args:
+            try:
+                flags.extend(shlex.split(extra_args))
+            except Exception:
+                pass
+        return flags, download_mode
+
     def _animate_fade_in(self, widget: QWidget, delay_ms: int = 0) -> None:
+        if isinstance(widget, PosterCard):
+            return
         def _start() -> None:
             effect = QGraphicsOpacityEffect(widget)
             widget.setGraphicsEffect(effect)
@@ -788,6 +1015,159 @@ class AniCliFullscreen(QWidget):
             QTimer.singleShot(delay_ms, _start)
         else:
             _start()
+
+    def _reload_theme_if_needed(self) -> None:
+        current_mtime = theme_palette_mtime()
+        if current_mtime == self._theme_mtime:
+            return
+        self._theme_mtime = current_mtime
+        self.theme = load_runtime_theme()
+        self._apply_theme()
+        if hasattr(self, "search_input"):
+            for action in self.search_input.actions():
+                self.search_input.removeAction(action)
+            search_action = QAction(self)
+            search_action.setIcon(self._search_icon())
+            self.search_input.addAction(search_action, QLineEdit.ActionPosition.LeadingPosition)
+        for card in self._poster_cards:
+            card.update_theme(self.theme)
+
+    def _apply_theme(self) -> None:
+        theme = self.theme
+        primary = str(theme.get("primary", "#CBA6F7"))
+        secondary = str(theme.get("secondary", "#89B4FA"))
+        on_primary = str(theme.get("on_primary", "#11111B"))
+        background = str(theme.get("background", "#11111B"))
+        surface = str(theme.get("surface", "#181825"))
+        surface_container = str(theme.get("surface_container", "#1E1E2E"))
+        surface_container_high = str(theme.get("surface_container_high", "#313244"))
+        text = str(theme.get("text", "#CDD6F4"))
+        text_muted = str(theme.get("text_muted", rgba("#CDD6F4", 0.78)))
+        outline = str(theme.get("outline", "#6C7086"))
+        status = rgba(str(theme.get("on_surface_variant", "#A6ADC8")), 0.78)
+
+        self.setStyleSheet(
+            f"""
+            QWidget {{
+                font-family: '{self.font_family}';
+                color: {text};
+            }}
+            QWidget#rootWindow {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 {blend(background, surface, 0.15)},
+                    stop: 0.5 {surface},
+                    stop: 1 {background}
+                );
+            }}
+            QFrame#topBar {{
+                background: {rgba(surface_container, 0.85)};
+                border-radius: 24px;
+                border: 1px solid {rgba(outline, 0.28)};
+            }}
+            QLineEdit#searchInput {{
+                background: {rgba(surface_container_high, 0.55)};
+                border: 1px solid {rgba(outline, 0.34)};
+                border-radius: 18px;
+                padding: 10px 16px 10px 38px;
+                font-size: 15px;
+                color: {text};
+            }}
+            QLineEdit#searchInput:focus {{
+                border: 1px solid {rgba(primary, 0.98)};
+                background: {rgba(primary, 0.10)};
+            }}
+            QPushButton#refreshButton {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 1, stop: 0 {primary}, stop: 1 {secondary});
+                border: none;
+                border-radius: 18px;
+                color: {on_primary};
+                padding: 10px 20px;
+                font-weight: bold;
+                font-size: 14px;
+            }}
+            QPushButton#refreshButton:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 1, stop: 0 {blend(primary, "#FFFFFF", 0.18)}, stop: 1 {blend(secondary, "#FFFFFF", 0.18)});
+            }}
+            QPushButton#closeRound {{
+                background: {rgba(primary, 0.14)};
+                border: 1px solid {rgba(primary, 0.36)};
+                border-radius: 18px;
+                color: {primary};
+                font-size: 16px;
+                font-weight: bold;
+            }}
+            QPushButton#closeRound:hover {{
+                background: {primary};
+                color: {on_primary};
+            }}
+            QFrame#glassPanel {{
+                background: {rgba(surface_container, 0.68)};
+                border: 1px solid {rgba(outline, 0.24)};
+                border-radius: 24px;
+            }}
+            QLabel#statusLabel {{
+                color: {status};
+                font-weight: 600;
+            }}
+            QLabel#episodeTitle {{
+                color: {blend(primary, text, 0.35)};
+            }}
+            QLabel#episodeHint {{
+                color: {text_muted};
+            }}
+            QScrollArea#posterScroll {{
+                border: none;
+                background: transparent;
+            }}
+            QScrollArea#posterScroll > QWidget > QWidget {{
+                background: transparent;
+            }}
+            QScrollBar:vertical {{
+                border: none;
+                background: transparent;
+                width: 8px;
+                margin: 10px 0 10px 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {rgba(outline, 0.50)};
+                min-height: 30px;
+                border-radius: 4px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background: {rgba(primary, 0.64)}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+            QListWidget#episodesList {{
+                background: transparent;
+                border: none;
+                outline: none;
+            }}
+            QListWidget#episodesList::item {{
+                padding: 14px 20px;
+                border-radius: 16px;
+                margin-bottom: 6px;
+                background: {rgba(surface_container_high, 0.45)};
+                color: {text};
+                font-size: 15px;
+            }}
+            QListWidget#episodesList::item:selected {{
+                background: {primary};
+                color: {on_primary};
+                font-weight: bold;
+            }}
+            QPushButton#ghostButton {{
+                background: {rgba(surface_container_high, 0.64)};
+                border: none;
+                color: {text};
+                border-radius: 16px;
+                padding: 10px 20px;
+                font-weight: bold;
+            }}
+            QPushButton#ghostButton:hover {{
+                background: {rgba(primary, 0.14)};
+                color: {primary};
+            }}
+            """
+        )
 
     def _select_card(self, index: int) -> None:
         if not self._poster_cards:
@@ -884,16 +1264,8 @@ class AniCliFullscreen(QWidget):
         if shutil.which("ani-cli") is None:
             self.episode_hint.setText("Ani CLI is not installed yet.")
             return
-        command = [
-            "ani-cli",
-            "-S",
-            "1",
-            "--no-detach",
-            "--exit-after-play",
-            "-e",
-            episode,
-            title,
-        ]
+        flags, download_mode = self._ani_cli_flags_from_settings()
+        command = ["ani-cli", *flags, "-e", episode, title]
         try:
             self._playback_process = subprocess.Popen(
                 command,
@@ -901,12 +1273,18 @@ class AniCliFullscreen(QWidget):
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            self.episode_hint.setText(
-                f"Opening {title} episode {episode}. "
-                "Enjoy your episode; Hanauta returns automatically when playback ends."
-            )
-            self.hide()
-            QTimer.singleShot(650, self._focus_mpv_window)
+            if download_mode:
+                self.episode_hint.setText(
+                    f"Downloading {title} episode {episode}. "
+                    "This can take a while depending on your connection."
+                )
+            else:
+                self.episode_hint.setText(
+                    f"Opening {title} episode {episode}. "
+                    "Enjoy your episode; Hanauta returns automatically when playback ends."
+                )
+                self.hide()
+                QTimer.singleShot(650, self._focus_mpv_window)
             self._playback_poll_timer.start()
         except Exception as exc:
             self.episode_hint.setText(f"Failed to launch episode: {exc}")

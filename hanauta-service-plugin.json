@@ -1,0 +1,16 @@
+{
+  "plugin_id": "ani_cli_widget",
+  "tasks": [
+    {
+      "id": "catalog_preload",
+      "enabled": true,
+      "interval_seconds": 300,
+      "timeout_seconds": 25,
+      "working_dir": "${PLUGIN_DIR}",
+      "command": [
+        "python3",
+        "${PLUGIN_DIR}/service_preload.py"
+      ]
+    }
+  ]
+}
